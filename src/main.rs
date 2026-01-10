@@ -4,6 +4,7 @@ mod tracker;
 mod world;
 mod motion;
 mod radio;
+mod game_controller;
 #[path = "GUI/mod.rs"]
 mod gui;
 
@@ -11,6 +12,7 @@ use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock as TokioRwLock};
 use vision::{Vision, VisionEvent};
 use gui::ConfigUpdate;
 use world::{World, RobotState};
+use game_controller::{GameController, GameState};
 use std::time::Duration;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
@@ -23,6 +25,10 @@ fn main() {
     let vision_ip = "224.5.23.2".to_string();
     let vision_port = 10020;
     
+    // GameController multicast address (standard SSL port)
+    let gc_ip = "224.5.23.1".to_string();
+    let gc_port = 10003;
+    
     let gui_ip = vision_ip.clone();
     let gui_port = vision_port;
     let gui_config_tx = config_tx.clone();
@@ -31,6 +37,10 @@ fn main() {
     // Usar TokioRwLock para acceso async-friendly
     let world = Arc::new(TokioRwLock::new(World::new(11, 11)));
     let world_clone = world.clone();
+    
+    // Create GameController state (shared across modules)
+    let game_state = Arc::new(TokioRwLock::new(GameState::default()));
+    let game_state_clone = game_state.clone();
     
     // Create shared flag for tracker state
     let tracker_enabled = Arc::new(AtomicBool::new(true)); // Habilitado por defecto
@@ -125,8 +135,19 @@ fn main() {
                 }
             });
 
+            // Spawn GameController task
+            let gc_ip_clone = gc_ip.clone();
+            let gc_state_for_gc = game_state_clone.clone();
+            tokio::spawn(async move {
+                let mut gc = GameController::new(gc_ip_clone, gc_port);
+                // Run GameController (this will loop forever)
+                if let Err(e) = gc.run(gc_state_for_gc, None).await {
+                    eprintln!("[GameController] Error fatal: {}", e);
+                }
+            });
+
             // Initialize Motion and Radio systems
-            let motion = motion::Motion::new();
+            let motion = Arc::new(TokioMutex::new(motion::Motion::new()));
             let radio = match radio::Radio::new(false, "127.0.0.1", 20011).await {
                 Ok(r) => Arc::new(TokioMutex::new(r)),
                 Err(_e) => {
@@ -143,6 +164,7 @@ fn main() {
             // consider migrating World to use tokio::sync::RwLock in the future.
             let world_for_motion = world_clone.clone();
             let radio_for_motion = radio.clone();
+            let motion_for_loop = motion.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(16)); // ~60 FPS
                 loop {
@@ -164,13 +186,14 @@ fn main() {
                     }
                     
                     let mut radio_guard = radio_for_motion.lock().await;
+                    let mut motion_guard = motion_for_loop.lock().await;
                     
                     let mut commands_added = 0;
                     for robot_state in robots_data {
                         if robot_state.active {
                             let motion_cmd = {
                                 let world = world_for_motion.read().await;
-                                motion.move_to(&robot_state, ball_pos, &world)
+                                motion_guard.move_to(&robot_state, ball_pos, &world)
                             };
                             radio_guard.add_motion_command(motion_cmd);
                             commands_added += 1;

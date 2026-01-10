@@ -2,11 +2,13 @@ mod commands;
 mod environment;
 mod path_planner;
 mod pid;
+mod bang_bang;
 
 pub use commands::{MotionCommand, KickerCommand, RobotCommand};
 pub use environment::Environment;
 pub use path_planner::FastPathPlanner;
 pub use pid::PIDController;
+pub use bang_bang::BangBangController;
 
 use crate::world::{World, RobotState};
 use glam::Vec2;
@@ -14,6 +16,7 @@ use glam::Vec2;
 /// Módulo principal de control de movimiento
 pub struct Motion {
     path_planner: FastPathPlanner,
+    bangbang: BangBangController,
 }
 
 impl Motion {
@@ -21,6 +24,7 @@ impl Motion {
     pub fn new() -> Self {
         Self {
             path_planner: FastPathPlanner::new(5), // max_depth = 5
+            bangbang: BangBangController::new(15.0, 2.5), // max_accel=15.0 m/s² (muy alta), max_vel=2.5 m/s
         }
     }
     
@@ -38,9 +42,9 @@ impl Motion {
         normalized
     }
     
-    /// Movimiento hacia un objetivo usando path planner
+    /// Movimiento hacia un objetivo usando path planner con Bang-Bang Control
     pub fn move_to(
-        &self,
+        &mut self,
         robot_state: &RobotState,
         target: Vec2,
         world: &World,
@@ -52,7 +56,7 @@ impl Motion {
         if path.len() > 1 {
             let next_point = path[1];
             let direction = (next_point - robot_state.position).normalize();
-            let speed = 1.5; // Velocidad máxima (m/s)
+            let speed = 2.0; // Velocidad máxima (m/s) - aumentada para compensar Bang-Bang
             
             MotionCommand {
                 id: robot_state.id,
@@ -77,7 +81,7 @@ impl Motion {
     
     /// Movimiento directo sin evasión de obstáculos
     pub fn move_direct(
-        &self,
+        &mut self,
         robot_state: &RobotState,
         target: Vec2,
     ) -> MotionCommand {
@@ -97,10 +101,7 @@ impl Motion {
         }
         
         let direction = diff.normalize();
-        // Velocidad máxima para grSim es típicamente 2.0 m/s, pero usamos 1.5 para seguridad
-        let speed = 1.5f32.min(distance * 2.0); // Velocidad proporcional a la distancia, máximo 1.5 m/s
-        
-        // Asegurar que la velocidad no sea cero si hay distancia
+        let speed = 2.0f32.min(distance * 2.0); // Velocidad proporcional, máximo 2.0 m/s
         let speed = speed.max(0.1); // Mínimo 0.1 m/s para que se mueva
         
         MotionCommand {
@@ -109,13 +110,13 @@ impl Motion {
             vx: (direction.x * speed) as f64,
             vy: (direction.y * speed) as f64,
             omega: 0.0,
-            orientation: robot_state.orientation, // Guardar orientación para conversión a coordenadas locales
+            orientation: robot_state.orientation,
         }
     }
     
     /// Control PID personalizado para movimiento en X e Y
     pub fn motion(
-        &self,
+        &mut self,
         robot_state: &RobotState,
         target: Vec2,
         _world: &World,
@@ -198,7 +199,7 @@ impl Motion {
     
     /// Movimiento con orientación simultáneos
     pub fn motion_with_orientation(
-        &self,
+        &mut self,
         robot_state: &RobotState,
         target: Vec2,
         target_angle: f64,
