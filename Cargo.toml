@@ -11,6 +11,8 @@ iced = { version = "0.13", features = ["canvas", "tokio"] }
 nalgebra = "0.33" # Álgebra lineal para Kalman (similar a Eigen en C++)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+mlua = { version = "0.9", features = ["luajit", "async", "vendored"] } # Lua bindings con async support (LuaJIT, compilado desde fuente)
+tracing = "0.1"
 
 [build-dependencies]
 protobuf-codegen = "3" # Tool to generate Rust code from .proto files
