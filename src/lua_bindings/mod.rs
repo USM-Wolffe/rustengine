@@ -26,6 +26,25 @@ use tracing::{error, warn, info};
 pub enum LuaCommand {
     Motion(MotionCommand),
     Kicker(KickerCommand),
+    // Requests que necesitan procesamiento con World completo y Motion
+    MoveToRequest {
+        id: i32,
+        team: i32,
+        target: glam::Vec2,
+    },
+    MoveDirectRequest {
+        id: i32,
+        team: i32,
+        target: glam::Vec2,
+    },
+    FaceToRequest {
+        id: i32,
+        team: i32,
+        target: glam::Vec2,
+        kp: f64,
+        ki: f64,
+        kd: f64,
+    },
 }
 
 // --- WorldSnapshot: Snapshot inmutable de World para pasar a Lua ---
@@ -327,9 +346,7 @@ pub fn setup_lua_environment(
     // --- Funciones de Motion (síncronas, envían comandos al canal) ---
     
     // move_to(robotId: number, team: number, point: {x: number, y: number})
-    // Nota: Esta función necesita hacer operaciones async (leer World completo, calcular Motion con path planning)
-    // Por ahora, almacenamos la solicitud en un canal y el task async procesará usando Motion.move_to() completo
-    // Para simplificar, también aceptamos un comando simplificado directamente
+    // Envía un MoveToRequest que será procesado por el task async con path planning completo
     let move_to = {
         let ctx = ctx.clone();
         lua.create_function(move |_lua, (id, team, point_table): (i32, i32, Table)| {
@@ -342,52 +359,15 @@ pub fn setup_lua_environment(
             // Leer punto
             let x: f64 = point_table.get("x").ok().unwrap_or(0.0);
             let y: f64 = point_table.get("y").ok().unwrap_or(0.0);
+            let target = glam::Vec2::new(x as f32, y as f32);
             
-            // Obtener estado del robot desde snapshot
-            let (orientation, current_pos) = {
-                let snapshot_guard = ctx.world_snapshot.read().unwrap();
-                if let Some(robot) = snapshot_guard.get_robot_state(id, team) {
-                    (robot.orientation, Vec2::new(robot.x as f32, robot.y as f32))
-                } else {
-                    (0.0, Vec2::ZERO)
-                }
-            };
-            
-            // Calcular dirección hacia el objetivo (versión simplificada sin path planning)
-            // El task async debería procesar esto usando Motion.move_to() completo con path planning
-            let target = Vec2::new(x as f32, y as f32);
-            let diff = target - current_pos;
-            let distance = diff.length();
-            
-            if distance < 0.1 {
-                // Ya está cerca, detener
-                let motion_cmd = MotionCommand {
-                    id,
-                    team,
-                    vx: 0.0,
-                    vy: 0.0,
-                    omega: 0.0,
-                    orientation,
-                };
-                let _ = ctx.command_tx.send(LuaCommand::Motion(motion_cmd));
-                return Ok(());
-            }
-            
-            let direction = diff.normalize_or_zero();
-            let speed = 2.0f32.min(distance * 2.0).max(0.1);
-            
-            let motion_cmd = MotionCommand {
+            // Enviar request al canal (será procesado por task async con World completo y path planning)
+            if let Err(e) = ctx.command_tx.send(LuaCommand::MoveToRequest {
                 id,
                 team,
-                vx: (direction.x * speed) as f64,
-                vy: (direction.y * speed) as f64,
-                omega: 0.0,
-                orientation,
-            };
-            
-            // Enviar comando al canal (operación síncrona)
-            if let Err(e) = ctx.command_tx.send(LuaCommand::Motion(motion_cmd)) {
-                warn!("move_to: Error enviando comando: {}", e);
+                target,
+            }) {
+                warn!("move_to: Error enviando request: {}", e);
             }
             
             Ok(())
@@ -398,6 +378,7 @@ pub fn setup_lua_environment(
     lua.globals().set("move_to", move_to_global)?;
     
     // move_direct(robotId: number, team: number, point: {x: number, y: number})
+    // Envía un MoveDirectRequest que será procesado por el task async sin path planning
     let move_direct = {
         let ctx = ctx.clone();
         lua.create_function(move |_lua, (id, team, point_table): (i32, i32, Table)| {
@@ -410,51 +391,15 @@ pub fn setup_lua_environment(
             // Leer punto
             let x: f64 = point_table.get("x").ok().unwrap_or(0.0);
             let y: f64 = point_table.get("y").ok().unwrap_or(0.0);
+            let target = glam::Vec2::new(x as f32, y as f32);
             
-            // Obtener estado del robot desde snapshot
-            let (orientation, current_pos) = {
-                let snapshot_guard = ctx.world_snapshot.read().unwrap();
-                if let Some(robot) = snapshot_guard.get_robot_state(id, team) {
-                    (robot.orientation, Vec2::new(robot.x as f32, robot.y as f32))
-                } else {
-                    (0.0, Vec2::ZERO)
-                }
-            };
-            
-            // Calcular dirección hacia el objetivo
-            let target = Vec2::new(x as f32, y as f32);
-            let diff = target - current_pos;
-            let distance = diff.length();
-            
-            if distance < 0.1 {
-                // Ya está cerca, detener
-                let motion_cmd = MotionCommand {
-                    id,
-                    team,
-                    vx: 0.0,
-                    vy: 0.0,
-                    omega: 0.0,
-                    orientation,
-                };
-                let _ = ctx.command_tx.send(LuaCommand::Motion(motion_cmd));
-                return Ok(());
-            }
-            
-            let direction = diff.normalize_or_zero();
-            let speed = 2.0f32.min(distance * 2.0).max(0.1);
-            
-            let motion_cmd = MotionCommand {
+            // Enviar request al canal (será procesado por task async sin path planning)
+            if let Err(e) = ctx.command_tx.send(LuaCommand::MoveDirectRequest {
                 id,
                 team,
-                vx: (direction.x * speed) as f64,
-                vy: (direction.y * speed) as f64,
-                omega: 0.0,
-                orientation,
-            };
-            
-            // Enviar comando al canal
-            if let Err(e) = ctx.command_tx.send(LuaCommand::Motion(motion_cmd)) {
-                warn!("move_direct: Error enviando comando: {}", e);
+                target,
+            }) {
+                warn!("move_direct: Error enviando request: {}", e);
             }
             
             Ok(())
@@ -465,7 +410,7 @@ pub fn setup_lua_environment(
     lua.globals().set("move_direct", move_direct_global)?;
     
     // face_to(robotId: number, team: number, point: {x: number, y: number}, kp?: number, ki?: number, kd?: number)
-    // Acepta parámetros posicionales con valores opcionales
+    // Envía un FaceToRequest que será procesado por el task async con PID completo y estado persistente
     let face_to = {
         let ctx = ctx.clone();
         lua.create_function(move |_lua, (id, team, point_table, kp, ki, kd): (i32, i32, Table, Option<f64>, Option<f64>, Option<f64>)| {
@@ -482,48 +427,18 @@ pub fn setup_lua_environment(
             // Leer punto
             let x: f64 = point_table.get("x").ok().unwrap_or(0.0);
             let y: f64 = point_table.get("y").ok().unwrap_or(0.0);
-            let target = Vec2::new(x as f32, y as f32);
+            let target = glam::Vec2::new(x as f32, y as f32);
             
-            // Obtener posición y orientación del robot desde snapshot
-            let (current_pos, orientation) = {
-                let snapshot_guard = ctx.world_snapshot.read().unwrap();
-                if let Some(robot) = snapshot_guard.get_robot_state(id, team) {
-                    (Vec2::new(robot.x as f32, robot.y as f32), robot.orientation)
-                } else {
-                    warn!("face_to: Robot no encontrado (id={}, team={})", id, team);
-                    return Ok(());
-                }
-            };
-            
-            // Calcular dirección hacia el objetivo
-            let direction = (target - current_pos).normalize_or_zero();
-            let target_angle = direction.y.atan2(direction.x) as f64;
-            
-            // Calcular error angular (PID simplificado con solo P por ahora)
-            let error = target_angle - orientation;
-            let mut normalized_error = error % (2.0 * std::f64::consts::PI);
-            if normalized_error > std::f64::consts::PI {
-                normalized_error -= 2.0 * std::f64::consts::PI;
-            } else if normalized_error < -std::f64::consts::PI {
-                normalized_error += 2.0 * std::f64::consts::PI;
-            }
-            
-            let omega: f64 = normalized_error * kp;
-            let omega_limited: f64 = omega.max(-3.0).min(3.0); // Limitar velocidad angular
-            
-            // Crear comando de orientación
-            let motion_cmd = MotionCommand {
+            // Enviar request al canal (será procesado por task async con PID completo y estado persistente)
+            if let Err(e) = ctx.command_tx.send(LuaCommand::FaceToRequest {
                 id,
                 team,
-                vx: 0.0,
-                vy: 0.0,
-                omega: omega_limited,
-                orientation,
-            };
-            
-            // Enviar comando al canal
-            if let Err(e) = ctx.command_tx.send(LuaCommand::Motion(motion_cmd)) {
-                warn!("face_to: Error enviando comando: {}", e);
+                target,
+                kp,
+                ki,
+                kd,
+            }) {
+                warn!("face_to: Error enviando request: {}", e);
             }
             
             Ok(())

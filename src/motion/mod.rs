@@ -42,7 +42,15 @@ impl Motion {
         normalized
     }
     
-    /// Movimiento hacia un objetivo usando path planner con Bang-Bang Control
+    /// Obtiene el path planificado hacia un objetivo (helper para Bang-Bang)
+    pub fn get_path_to(&self, robot_state: &RobotState, target: Vec2, world: &World) -> Vec<Vec2> {
+        let env = Environment::new(world, robot_state);
+        self.path_planner.get_path(robot_state.position, target, &env)
+    }
+    
+    /// Movimiento hacia un objetivo usando path planner
+    /// Retorna velocidades deseadas que luego serán suavizadas con Bang-Bang en el caller
+    /// También calcula orientación hacia el siguiente punto del path
     pub fn move_to(
         &mut self,
         robot_state: &RobotState,
@@ -56,14 +64,24 @@ impl Motion {
         if path.len() > 1 {
             let next_point = path[1];
             let direction = (next_point - robot_state.position).normalize();
-            let speed = 2.0; // Velocidad máxima (m/s) - aumentada para compensar Bang-Bang
+            let speed = 2.5; // Velocidad máxima (m/s) - será suavizada con Bang-Bang
+            
+            // Calcular orientación hacia el siguiente punto del path
+            let target_angle = direction.y.atan2(direction.x) as f64;
+            let error = Self::normalize_angle(target_angle - robot_state.orientation);
+            
+            // Control simple de orientación (P controller) hacia el siguiente punto
+            let kp_omega = 2.0; // Ganancia proporcional para orientación
+            let omega = error * kp_omega;
+            let max_omega = 3.0; // rad/s
+            let omega_limited = omega.max(-max_omega).min(max_omega);
             
             MotionCommand {
                 id: robot_state.id,
                 team: robot_state.team,
                 vx: direction.x as f64 * speed,
                 vy: direction.y as f64 * speed,
-                omega: 0.0,
+                omega: omega_limited,
                 orientation: robot_state.orientation,
             }
         } else {
@@ -155,32 +173,28 @@ impl Motion {
         }
     }
     
-    /// Orientar hacia un punto
+    /// Orientar hacia un punto usando PID persistente
     pub fn face_to(
         &self,
         robot_state: &RobotState,
         target: Vec2,
-        kp: f64,
-        ki: f64,
-        kd: f64,
+        pid: &mut PIDController,
+        dt: f64,
     ) -> MotionCommand {
         let direction = (target - robot_state.position).normalize();
         let target_angle = direction.y.atan2(direction.x) as f64;
-        self.face_to_angle(robot_state, target_angle, kp, ki, kd)
+        self.face_to_angle(robot_state, target_angle, pid, dt)
     }
     
-    /// Orientar hacia un ángulo específico
+    /// Orientar hacia un ángulo específico usando PID persistente
     pub fn face_to_angle(
         &self,
         robot_state: &RobotState,
         target_angle: f64,
-        kp: f64,
-        ki: f64,
-        kd: f64,
+        pid: &mut PIDController,
+        dt: f64,
     ) -> MotionCommand {
-        let mut pid = PIDController::new(kp, ki, kd);
         let error = Self::normalize_angle(target_angle - robot_state.orientation);
-        let dt = 0.016; // ~60 FPS
         let omega = pid.compute(error, dt);
         
         // Limitar velocidad angular máxima
@@ -198,6 +212,8 @@ impl Motion {
     }
     
     /// Movimiento con orientación simultáneos
+    /// Nota: Esta función requiere un PIDController persistente, pero por ahora
+    /// crea uno temporal. En el futuro debería aceptar &mut PIDController.
     pub fn motion_with_orientation(
         &mut self,
         robot_state: &RobotState,
@@ -214,7 +230,11 @@ impl Motion {
     ) -> MotionCommand {
         // Combinar move_to y face_to_angle
         let motion_cmd = self.move_to(robot_state, target, world);
-        let face_cmd = self.face_to_angle(robot_state, target_angle, kp_theta, ki_theta, kd_theta);
+        
+        // Crear PID temporal para orientación (no ideal, pero necesario por la firma actual)
+        let mut pid = PIDController::new(kp_theta, ki_theta, kd_theta);
+        let dt = 0.016;
+        let face_cmd = self.face_to_angle(robot_state, target_angle, &mut pid, dt);
         
         MotionCommand {
             id: robot_state.id,

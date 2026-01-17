@@ -50,6 +50,21 @@ impl PIDController {
         self.integral = 0.0;
         self.last_error = 0.0;
     }
+    
+    /// Obtiene la ganancia proporcional
+    pub fn get_kp(&self) -> f64 {
+        self.kp
+    }
+    
+    /// Obtiene la ganancia integral
+    pub fn get_ki(&self) -> f64 {
+        self.ki
+    }
+    
+    /// Obtiene la ganancia derivativa
+    pub fn get_kd(&self) -> f64 {
+        self.kd
+    }
 }
 
 #[cfg(test)]

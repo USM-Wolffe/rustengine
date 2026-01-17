@@ -18,7 +18,10 @@ use lua_bindings::{LuaContext, load_strategy_sync, execute_process_sync};
 use mlua::Lua;
 use std::time::Duration;
 use std::sync::{Arc, Mutex as StdMutex, atomic::{AtomicBool, Ordering}};
+use std::collections::HashMap;
 use tracing::{error, warn, info};
+use motion::{Motion, PIDController, BangBangController};
+use glam::Vec2;
 
 fn main() {
     // Leer argumento de línea de comandos (ruta al script Lua)
@@ -256,20 +259,172 @@ fn main() {
                 }
             }
             
+            // Estado persistente por robot para Motion (PID y Bang-Bang)
+            #[derive(Debug, Clone, PartialEq)]
+            enum CommandType {
+                MoveTo,
+                MoveDirect,
+                FaceTo,
+                Direct, // Para MotionCommand directo
+            }
+            
+            struct RobotMotionState {
+                pid_controller: PIDController,
+                bang_bang: BangBangController,
+                last_command_type: CommandType,
+            }
+            
+            impl RobotMotionState {
+                fn new() -> Self {
+                    Self {
+                        pid_controller: PIDController::new(3.5, 0.7, 0.1), // Valores por defecto
+                        bang_bang: BangBangController::new(15.0, 2.5), // max_accel=15.0, max_vel=2.5
+                        last_command_type: CommandType::Direct,
+                    }
+                }
+            }
+            
             // Spawn a task to process commands from Lua channel and add to Radio
             let radio_for_commands = radio.clone();
+            let world_for_motion = world_clone.clone();
+            let motion_for_processing = motion.clone();
+            let mut robot_states: HashMap<(i32, i32), RobotMotionState> = HashMap::new();
+            
             tokio::spawn(async move {
+                let dt = 0.016; // ~60 FPS
                 loop {
                     // Procesar comandos del canal (no bloqueante con try_recv)
                     while let Ok(cmd) = command_rx.try_recv() {
                         match cmd {
                             lua_bindings::LuaCommand::Motion(motion_cmd) => {
+                                // Comando directo, enviar a Radio
                                 let mut radio_guard = radio_for_commands.lock().await;
                                 radio_guard.add_motion_command(motion_cmd);
                             }
                             lua_bindings::LuaCommand::Kicker(kicker_cmd) => {
                                 let mut radio_guard = radio_for_commands.lock().await;
                                 radio_guard.add_kicker_command(kicker_cmd);
+                            }
+                            lua_bindings::LuaCommand::MoveToRequest { id, team, target } => {
+                                // Obtener World y RobotState
+                                let world_guard = world_for_motion.read().await;
+                                if let Some(robot_state) = world_guard.get_robot_state(id, team) {
+                                    let robot_state_clone = robot_state.clone();
+                                    drop(world_guard);
+                                    
+                                    // Obtener o crear estado del robot
+                                    let robot_key = (id, team);
+                                    let robot_motion_state = robot_states.entry(robot_key).or_insert_with(|| RobotMotionState::new());
+                                    
+                                    // Resetear si cambió el tipo de comando
+                                    if robot_motion_state.last_command_type != CommandType::MoveTo {
+                                        robot_motion_state.bang_bang.reset();
+                                        robot_motion_state.last_command_type = CommandType::MoveTo;
+                                    }
+                                    
+                                    // Llamar Motion::move_to() con World completo
+                                    let mut motion_guard = motion_for_processing.lock().await;
+                                    let world_guard = world_for_motion.read().await;
+                                    
+                                    // Calcular el siguiente punto del path para aplicar Bang-Bang correctamente
+                                    let path = motion_guard.get_path_to(&robot_state_clone, target, &world_guard);
+                                    let next_target = if path.len() > 1 {
+                                        path[1] // Siguiente punto del path
+                                    } else {
+                                        target // Si el path es directo, usar el target final
+                                    };
+                                    
+                                    let mut motion_cmd = motion_guard.move_to(&robot_state_clone, target, &world_guard);
+                                    drop(world_guard);
+                                    drop(motion_guard);
+                                    
+                                    // Aplicar Bang-Bang al siguiente punto del path (no al target final)
+                                    let current_vel = Vec2::new(robot_state_clone.velocity.x, robot_state_clone.velocity.y);
+                                    let smoothed_vel = robot_motion_state.bang_bang.compute_profile_with_velocity(
+                                        robot_state_clone.position,
+                                        next_target,
+                                        current_vel,
+                                        dt,
+                                    );
+                                    
+                                    // Actualizar velocidades con Bang-Bang (suaviza aceleración hacia el siguiente punto)
+                                    motion_cmd.vx = smoothed_vel.x as f64;
+                                    motion_cmd.vy = smoothed_vel.y as f64;
+                                    // Nota: motion_cmd.omega ya está calculado por Motion::move_to() hacia el siguiente punto del path
+                                    
+                                    // Enviar comando a Radio
+                                    let mut radio_guard = radio_for_commands.lock().await;
+                                    radio_guard.add_motion_command(motion_cmd);
+                                }
+                            }
+                            lua_bindings::LuaCommand::MoveDirectRequest { id, team, target } => {
+                                // Obtener World y RobotState
+                                let world_guard = world_for_motion.read().await;
+                                if let Some(robot_state) = world_guard.get_robot_state(id, team) {
+                                    let robot_state_clone = robot_state.clone();
+                                    drop(world_guard);
+                                    
+                                    // Obtener o crear estado del robot
+                                    let robot_key = (id, team);
+                                    let robot_motion_state = robot_states.entry(robot_key).or_insert_with(|| RobotMotionState::new());
+                                    
+                                    // Resetear si cambió el tipo de comando
+                                    if robot_motion_state.last_command_type != CommandType::MoveDirect {
+                                        robot_motion_state.bang_bang.reset();
+                                        robot_motion_state.last_command_type = CommandType::MoveDirect;
+                                    }
+                                    
+                                    // Llamar Motion::move_direct() (sin path planning)
+                                    let mut motion_guard = motion_for_processing.lock().await;
+                                    let motion_cmd = motion_guard.move_direct(&robot_state_clone, target);
+                                    drop(motion_guard);
+                                    
+                                    // Enviar comando a Radio
+                                    let mut radio_guard = radio_for_commands.lock().await;
+                                    radio_guard.add_motion_command(motion_cmd);
+                                }
+                            }
+                            lua_bindings::LuaCommand::FaceToRequest { id, team, target, kp, ki, kd } => {
+                                // Obtener World y RobotState
+                                let world_guard = world_for_motion.read().await;
+                                if let Some(robot_state) = world_guard.get_robot_state(id, team) {
+                                    let robot_state_clone = robot_state.clone();
+                                    drop(world_guard);
+                                    
+                                    // Obtener o crear estado del robot
+                                    let robot_key = (id, team);
+                                    let robot_motion_state = robot_states.entry(robot_key).or_insert_with(|| RobotMotionState::new());
+                                    
+                                    // Resetear si cambió el tipo de comando
+                                    if robot_motion_state.last_command_type != CommandType::FaceTo {
+                                        robot_motion_state.pid_controller.reset();
+                                        robot_motion_state.last_command_type = CommandType::FaceTo;
+                                    }
+                                    
+                                    // Actualizar parámetros PID si son diferentes
+                                    // Por ahora, recreamos el PID con los nuevos parámetros si cambian
+                                    // (en el futuro podríamos mantener PID separados por parámetros)
+                                    // Nota: Esto resetea el estado del PID, pero es necesario si los parámetros cambian
+                                    if robot_motion_state.pid_controller.get_kp() != kp || 
+                                       robot_motion_state.pid_controller.get_ki() != ki || 
+                                       robot_motion_state.pid_controller.get_kd() != kd {
+                                        robot_motion_state.pid_controller = PIDController::new(kp, ki, kd);
+                                    }
+                                    
+                                    // Llamar Motion::face_to() con PID persistente
+                                    let motion_guard = motion_for_processing.lock().await;
+                                    let motion_cmd = motion_guard.face_to(
+                                        &robot_state_clone,
+                                        target,
+                                        &mut robot_motion_state.pid_controller,
+                                        dt,
+                                    );
+                                    drop(motion_guard);
+                                    
+                                    // Enviar comando a Radio
+                                    let mut radio_guard = radio_for_commands.lock().await;
+                                    radio_guard.add_motion_command(motion_cmd);
+                                }
                             }
                         }
                     }
