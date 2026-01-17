@@ -286,6 +286,8 @@ pub fn setup_lua_environment(
             let table = lua.create_table()?;
             table.set("x", ball.x)?;
             table.set("y", ball.y)?;
+            table.set("vel_x", ball.vel_x)?;
+            table.set("vel_y", ball.vel_y)?;
             Ok(table)
         })?
     };

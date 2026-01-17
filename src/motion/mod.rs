@@ -98,6 +98,7 @@ impl Motion {
     }
     
     /// Movimiento directo sin evasión de obstáculos
+    /// También calcula orientación hacia el target para mejor control
     pub fn move_direct(
         &mut self,
         robot_state: &RobotState,
@@ -106,8 +107,8 @@ impl Motion {
         let diff = target - robot_state.position;
         let distance = diff.length();
         
-        // Si está muy cerca del objetivo, detenerse
-        if distance < 0.1 {
+        // Si está muy cerca del objetivo, detenerse (reducido a 0.05m para permitir captura)
+        if distance < 0.05 {
             return MotionCommand {
                 id: robot_state.id,
                 team: robot_state.team,
@@ -122,12 +123,20 @@ impl Motion {
         let speed = 2.0f32.min(distance * 2.0); // Velocidad proporcional, máximo 2.0 m/s
         let speed = speed.max(0.1); // Mínimo 0.1 m/s para que se mueva
         
+        // Calcular orientación hacia el target (control simple P)
+        let target_angle = direction.y.atan2(direction.x) as f64;
+        let error = Self::normalize_angle(target_angle - robot_state.orientation);
+        let kp_omega = 1.5; // Ganancia proporcional para orientación (más suave que move_to)
+        let omega = error * kp_omega;
+        let max_omega = 2.0; // rad/s (más lento que move_to para mejor control)
+        let omega_limited = omega.max(-max_omega).min(max_omega);
+        
         MotionCommand {
             id: robot_state.id,
             team: robot_state.team,
             vx: (direction.x * speed) as f64,
             vy: (direction.y * speed) as f64,
-            omega: 0.0,
+            omega: omega_limited,
             orientation: robot_state.orientation,
         }
     }

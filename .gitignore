@@ -3,3 +3,6 @@
 # Archivos markdown de documentación/guías (no subir al repositorio)
 *.md
 !README.md
+
+# Archivos de test Lua
+test_*.lua
